@@ -1,0 +1,12 @@
+# 環境專屬敏感設定，見 .env.example
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# 執行期間產生的檔案（測試結果、狀態快照、背景執行殘留）
+results/
+state/
+*.out
+run.pid
