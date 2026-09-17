@@ -28,10 +28,22 @@ set +a
 
 : "${POOL:?POOL 未設定，請檢查 .env}"
 : "${ISCSI_STORAGE_ID:?ISCSI_STORAGE_ID 未設定，請檢查 .env}"
-: "${SLOG_DEVICE:?SLOG_DEVICE 未設定，請檢查 .env}"
 : "${NEVER_TOUCH_VMS:?NEVER_TOUCH_VMS 未設定，請檢查 .env}"
-: "${BASE_DIR:?BASE_DIR 未設定，請檢查 .env}"
 NEVER_TOUCH_VMS=($NEVER_TOUCH_VMS)   # .env 存的是空白分隔字串，這裡轉成陣列
+
+# 部署路徑就是本專案所在目錄，不需要另外在 .env 指定
+BASE_DIR="$SCRIPT_DIR"
+
+# 自動偵測 pool 目前的 SLOG（log vdev）裝置名稱。不寫死在 .env，
+# 避免日後更換 SLOG 硬碟後，設定檔仍留著已經不存在的舊裝置名稱。
+_detect_slog_device() {
+    zpool status "$POOL" 2>/dev/null | awk '
+        /^[[:space:]]*logs[[:space:]]*$/ { in_logs=1; next }
+        in_logs && NF { print $1; exit }
+    '
+}
+SLOG_DEVICE=$(_detect_slog_device)
+[[ -n "$SLOG_DEVICE" ]] || die "在 zpool status ${POOL} 找不到 logs (SLOG) 裝置，請確認 pool 上已掛載 SLOG"
 
 # ---- 路徑常數 ----
 DATASET="${POOL}/fiotest"

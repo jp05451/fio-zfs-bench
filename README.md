@@ -24,11 +24,14 @@ cp .env.example .env
 |---|---|
 | `POOL` | ZFS pool 名稱 |
 | `ISCSI_STORAGE_ID` | Proxmox storage ID（底層對應到上面的 pool），用於動態掃描哪些 VM 用到這顆儲存 |
-| `SLOG_DEVICE` | SLOG 裝置的完整 vdev 名稱（`zpool status` 顯示的名稱，含裝置序號） |
 | `NEVER_TOUCH_VMS` | 絕不觸碰（測試期間絕不停機）的 VM ID 清單，以空白分隔 |
-| `BASE_DIR` | 腳本部署路徑，同時也是 `results/`、`state/` 的存放位置 |
 
 `.env` 內容為此主機的基礎設施識別資訊，**不會提交進 git**（已列在 `.gitignore`）。`.env.example` 只是格式範本，可安全提交。
+
+以下兩項不需要設定，程式會自動偵測，避免設定檔過期：
+
+- **SLOG 裝置**：從 `zpool status $POOL` 的 `logs` 區塊即時讀取，換過 SLOG 硬碟後不需要改設定
+- **部署路徑**：就是 `run_all.sh` 所在目錄，`results/`、`state/` 都存在這裡面
 
 ## 用法
 
