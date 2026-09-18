@@ -21,6 +21,9 @@ ARC_KEYS = (
     "l2_misses",
 )
 
+SLOG_CONDITIONS = ("standard", "disabled", "removed")
+SLOG_VARIANCE_WARN_PCT = 15.0
+
 
 def load_json(path: Path):
     try:
@@ -253,7 +256,55 @@ def section_coldhot(out, round_name, results):
     out.append("")
 
 
-def section_layer_contribution(out, round_name, results):
+def _collect_slog_condition(results, cond):
+    """回傳某 SLOG 組態（standard/disabled/removed）的 (name, TestResult) list，依重複編號排序。"""
+    items = [(name, r) for name, r in results.items() if name.startswith(f"slog_{cond}_r")]
+    items.sort(key=lambda nr: nr[0])
+    return items
+
+
+def _mean_and_spread_pct(values):
+    """回傳 (平均值, 相對變異幅度%)；values 為空回傳 (None, None)。"""
+    if not values:
+        return None, None
+    mean = sum(values) / len(values)
+    spread_pct = ((max(values) - min(values)) / mean * 100.0) if mean > 0 else None
+    return mean, spread_pct
+
+
+def section_slog_repeats(out, round_name, results):
+    """列出 SLOG 三組態各自的重複測試明細 + 平均值，並標示波動過大的組態。
+    回傳 {condition: 平均IOPS} 供 section_layer_contribution 計算貢獻量化使用。
+    """
+    out.append(f"## {round_name} SLOG 重複測試明細（各組態獨立檔案 + 打亂執行順序，避免序列污染/順序偏差）")
+    means = {}
+    for cond in SLOG_CONDITIONS:
+        items = _collect_slog_condition(results, cond)
+        if not items:
+            continue
+        values = [r.write_iops() or 0 for _, r in items]
+        mean, spread_pct = _mean_and_spread_pct(values)
+        means[cond] = mean
+        detail = ", ".join(f"{name}={fmt(r.write_iops(), decimals=0)}" for name, r in items)
+        warn = ""
+        if spread_pct is not None and spread_pct > SLOG_VARIANCE_WARN_PCT:
+            warn = f"  [警告: 重複測試間差異 {spread_pct:.1f}%，超過 {SLOG_VARIANCE_WARN_PCT:.0f}% 門檻，結果可能不穩定]"
+        out.append(f"  {cond:<10} {detail}  平均={fmt(mean, decimals=0)}{warn}")
+
+    raw = results.get("slog_raw_device")
+    if raw:
+        out.append(
+            f"  裸裝置基準線 (slog_raw_device，繞過 ZFS 直接測 SLOG partition): "
+            f"IOPS={fmt(raw.write_iops(), decimals=0)} p99={fmt(raw.write_lat_p99(), 'us', 0)}"
+            "  （僅供人工交叉比對，不納入下方自動貢獻量化計算）"
+        )
+    else:
+        out.append("  裸裝置基準線: (無資料)")
+    out.append("")
+    return means
+
+
+def section_layer_contribution(out, round_name, results, slog_means=None):
     out.append(f"## {round_name} 快取層貢獻量化")
 
     raw = results.get("isolation_raw")
@@ -275,18 +326,17 @@ def section_layer_contribution(out, round_name, results):
         out.append(f"  fsync 成本 (async-sync IOPS 差): "
                     f"async={fmt(w_async.write_iops(),decimals=0)} sync={fmt(w_sync.write_iops(),decimals=0)}")
 
-    slog_std = results.get("slog_sync_standard")
-    slog_dis = results.get("slog_sync_disabled")
-    slog_rm = results.get("slog_removed_sync")
-    if slog_std and slog_dis:
-        out.append(f"  SLOG fsync 成本 (standard vs disabled): "
-                    f"standard={fmt(slog_std.write_iops(),decimals=0)} "
-                    f"disabled(理論上限)={fmt(slog_dis.write_iops(),decimals=0)}")
-    if slog_std and slog_rm:
-        slog_gain = (slog_std.write_iops() or 0) - (slog_rm.write_iops() or 0)
-        out.append(f"  SLOG 貢獻 (standard-removed IOPS 差): {fmt(slog_gain, ' IOPS', 0)}"
-                    f"  (standard={fmt(slog_std.write_iops(),decimals=0)} "
-                    f"removed={fmt(slog_rm.write_iops(),decimals=0)})")
+    slog_means = slog_means or {}
+    std_mean = slog_means.get("standard")
+    dis_mean = slog_means.get("disabled")
+    rm_mean = slog_means.get("removed")
+    if std_mean is not None and dis_mean is not None:
+        out.append(f"  SLOG fsync 成本 (standard vs disabled，取重複測試平均): "
+                    f"standard={fmt(std_mean,decimals=0)} disabled(理論上限)={fmt(dis_mean,decimals=0)}")
+    if std_mean is not None and rm_mean is not None:
+        slog_gain = std_mean - rm_mean
+        out.append(f"  SLOG 貢獻 (standard-removed IOPS 差，取重複測試平均): {fmt(slog_gain, ' IOPS', 0)}"
+                    f"  (standard={fmt(std_mean,decimals=0)} removed={fmt(rm_mean,decimals=0)})")
     out.append("")
 
 
@@ -339,7 +389,8 @@ def main():
         section_metrics_table(out, round_name, results)
         section_cache_attribution(out, round_name, results)
         section_coldhot(out, round_name, results)
-        section_layer_contribution(out, round_name, results)
+        slog_means = section_slog_repeats(out, round_name, results)
+        section_layer_contribution(out, round_name, results, slog_means)
 
     section_round_comparison(out, round_results)
 

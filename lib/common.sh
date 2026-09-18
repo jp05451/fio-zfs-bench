@@ -77,6 +77,7 @@ if [[ "$MODE" == "smoke" ]]; then
     RUNTIME_WRITE=20
     RUNTIME_MIXED=20
     RUNTIME_SLOG=20
+    RUNTIME_SLOG_RAW=20
     L2ARC_WARM_DURATION=60
     SETTLE_AFTER_IMPORT=10
     ROUNDS=(1 2)
@@ -91,6 +92,7 @@ else
     RUNTIME_WRITE=1800
     RUNTIME_MIXED=1800
     RUNTIME_SLOG=600
+    RUNTIME_SLOG_RAW=120
     L2ARC_WARM_DURATION=2400
     SETTLE_AFTER_IMPORT=60
     ROUNDS=(1 2)
@@ -98,6 +100,8 @@ else
     MIXED_TEST_SIZE_MIB=4096
     SLOG_TEST_SIZE_MIB=2048
 fi
+
+SLOG_REPEATS=2   # 每個 sync 組態（standard/disabled/removed）重複次數，用來確認結果穩定，不是單次波動
 
 MIN_FILL_RATIO="0.95"   # 預熱填充率斷言門檻
 MIN_AVAIL_GIB=500       # preflight 最低可用空間
