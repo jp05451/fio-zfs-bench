@@ -45,6 +45,16 @@ _detect_slog_device() {
 SLOG_DEVICE=$(_detect_slog_device)
 [[ -n "$SLOG_DEVICE" ]] || die "在 zpool status ${POOL} 找不到 logs (SLOG) 裝置，請確認 pool 上已掛載 SLOG"
 
+# 自動偵測 L2ARC（cache vdev）裝置名稱，理由同上。找不到時回傳空字串而不是中止：
+# 一般 benchmark 不需要拆裝 L2ARC，只有 --diag 診斷模式會檢查並要求它必須存在。
+_detect_l2arc_device() {
+    zpool status "$POOL" 2>/dev/null | awk '
+        /^[[:space:]]*cache[[:space:]]*$/ { in_cache=1; next }
+        in_cache && NF { print $1; exit }
+    '
+}
+L2ARC_DEVICE=$(_detect_l2arc_device)
+
 # ---- 路徑常數 ----
 DATASET="${POOL}/fiotest"
 DATASET_MOUNT="/${DATASET}"
@@ -54,6 +64,7 @@ ARCSTATS_PATH="/proc/spl/kstat/zfs/arcstats"
 # ---- ZFS 可調參數路徑 ----
 ARC_MAX_PARAM="/sys/module/zfs/parameters/zfs_arc_max"
 L2ARC_WRITE_MAX_PARAM="/sys/module/zfs/parameters/l2arc_write_max"
+L2ARC_NOPREFETCH_PARAM="/sys/module/zfs/parameters/l2arc_noprefetch"
 ARC_MAX_ROUND2_BYTES=51539607552   # 48 GiB
 L2ARC_WRITE_MAX_WARM_BYTES=536870912  # 512 MiB/s，暖機期間暫時調高
 
@@ -84,6 +95,15 @@ if [[ "$MODE" == "smoke" ]]; then
     WRITE_TEST_SIZE_MIB=256
     MIXED_TEST_SIZE_MIB=256
     SLOG_TEST_SIZE_MIB=128
+    # --diag 診斷模式（phases/80_iso2.sh、90_slog2.sh）
+    ISO2_SIZE_MIB=512
+    RUNTIME_ISO2_RAW=20
+    RUNTIME_ISO2_MEASURE=20
+    ISO2_LOG_AVG_MSEC=5000
+    SLOG2_NUMJOBS=(1 4)
+    RUNTIME_SLOG2=15
+    RUNTIME_SLOG2_RAW=10
+    SLOG2_REPEATS=1
 else
     TIER_NAMES=(t1 t2 t3)
     declare -A TIER_SIZE_MIB=([t1]=2048 [t2]=65536 [t3]=307200)
@@ -99,6 +119,15 @@ else
     WRITE_TEST_SIZE_MIB=4096
     MIXED_TEST_SIZE_MIB=4096
     SLOG_TEST_SIZE_MIB=2048
+    # --diag 診斷模式（phases/80_iso2.sh、90_slog2.sh）
+    ISO2_SIZE_MIB=65536              # 同 T2 大小，落在 L2ARC 量級
+    RUNTIME_ISO2_RAW=300
+    RUNTIME_ISO2_MEASURE=900         # 拉長並記錄逐時 IOPS，觀察暖機曲線是否收斂
+    ISO2_LOG_AVG_MSEC=10000
+    SLOG2_NUMJOBS=(1 4 16 64)
+    RUNTIME_SLOG2=90
+    RUNTIME_SLOG2_RAW=60
+    SLOG2_REPEATS=2
 fi
 
 SLOG_REPEATS=2   # 每個 sync 組態（standard/disabled/removed）重複次數，用來確認結果穩定，不是單次波動

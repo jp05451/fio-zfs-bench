@@ -9,10 +9,11 @@ STATE_FILE="${STATE_DIR}/original.env"
 save_state() {
     mkdir -p "$STATE_DIR"
 
-    local orig_arc_max orig_l2_write_max orig_running_vms slog_present
+    local orig_arc_max orig_l2_write_max orig_l2_noprefetch orig_running_vms slog_present
 
     orig_arc_max=$(cat "$ARC_MAX_PARAM")
     orig_l2_write_max=$(cat "$L2ARC_WRITE_MAX_PARAM")
+    orig_l2_noprefetch=$(cat "$L2ARC_NOPREFETCH_PARAM" 2>/dev/null || echo "")
 
     orig_running_vms=""
     local vmid status
@@ -34,6 +35,8 @@ ORIG_ARC_MAX=${orig_arc_max}
 ORIG_L2ARC_WRITE_MAX=${orig_l2_write_max}
 ORIG_RUNNING_VMS="${orig_running_vms# }"
 ORIG_SLOG_PRESENT=${slog_present}
+ORIG_L2ARC_NOPREFETCH=${orig_l2_noprefetch}
+ORIG_L2ARC_DEVICE=${L2ARC_DEVICE}
 STATE_SAVED_AT="$(_ts)"
 EOF
     log_info "原始組態已記錄於 $STATE_FILE"
@@ -67,6 +70,24 @@ restore_state() {
         echo "$ORIG_L2ARC_WRITE_MAX" > "$L2ARC_WRITE_MAX_PARAM" 2>/dev/null \
             && log_info "l2arc_write_max 已還原為 $ORIG_L2ARC_WRITE_MAX" \
             || log_warn "還原 l2arc_write_max 失敗，請手動執行: echo $ORIG_L2ARC_WRITE_MAX > $L2ARC_WRITE_MAX_PARAM"
+    fi
+
+    if [[ -n "${ORIG_L2ARC_NOPREFETCH:-}" && -w "$L2ARC_NOPREFETCH_PARAM" ]]; then
+        echo "$ORIG_L2ARC_NOPREFETCH" > "$L2ARC_NOPREFETCH_PARAM" 2>/dev/null \
+            && log_info "l2arc_noprefetch 已還原為 $ORIG_L2ARC_NOPREFETCH" \
+            || log_warn "還原 l2arc_noprefetch 失敗，請手動執行: echo $ORIG_L2ARC_NOPREFETCH > $L2ARC_NOPREFETCH_PARAM"
+    fi
+
+    # 診斷模式會暫時拆掉 L2ARC（cache）裝置，中斷時務必裝回
+    if [[ -n "${ORIG_L2ARC_DEVICE:-}" ]]; then
+        local pool_status
+        pool_status=$(zpool status "$POOL" 2>/dev/null)
+        if [[ "$pool_status" != *"$ORIG_L2ARC_DEVICE"* ]]; then
+            log_warn "L2ARC 裝置原本存在但目前不在 pool 中，嘗試裝回"
+            zpool add "$POOL" cache "$ORIG_L2ARC_DEVICE" \
+                && log_info "L2ARC 裝置已裝回" \
+                || log_error "L2ARC 裝回失敗！請立即手動執行: zpool add $POOL cache $ORIG_L2ARC_DEVICE"
+        fi
     fi
 
     if [[ "$ORIG_SLOG_PRESENT" == "1" ]] && ! zpool status "$POOL" | grep -q "$SLOG_DEVICE"; then

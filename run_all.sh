@@ -6,6 +6,9 @@
 #   ./run_all.sh --preflight-only   只跑安全檢查，不執行任何測試/不動 VM
 #   ./run_all.sh --smoke            縮小規模驗證邏輯（約 10-15 分鐘）
 #   ./run_all.sh --full             正式規模（約 10 小時，兩輪）
+#   ./run_all.sh --full --round=2   只跑指定的一輪（--round=1 或 --round=2，中止後補跑用）
+#   ./run_all.sh --full --diag      診斷模式：只跑 Phase 80（隔離矩陣 v2）與 Phase 90（SLOG 併發掃描），
+#                                   會暫時拆裝 L2ARC 與 SLOG 裝置（約 4 小時）；--smoke --diag 為縮小規模驗證
 #
 # 建議搭配 nohup 背景執行:
 #   nohup ./run_all.sh --smoke > smoke.out 2>&1 & echo $! > run.pid
@@ -16,17 +19,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ACTION=""
 ROUND_ONLY=""
+DIAG=0
 for arg in "$@"; do
     case "$arg" in
         --preflight-only) ACTION="preflight-only" ;;
         --smoke)          ACTION="run"; MODE="smoke" ;;
         --full)           ACTION="run"; MODE="full" ;;
         --round=1|--round=2) ROUND_ONLY="${arg#--round=}" ;;
+        --diag)           DIAG=1 ;;
         *) echo "未知參數: $arg" >&2; exit 1 ;;
     esac
 done
 if [[ -z "$ACTION" ]]; then
-    echo "用法: $0 --preflight-only | --smoke | --full [--round=1|--round=2]" >&2
+    echo "用法: $0 --preflight-only | --smoke | --full [--round=1|--round=2] [--diag]" >&2
+    exit 1
+fi
+if [[ "$DIAG" == "1" && "$ACTION" != "run" ]]; then
+    echo "--diag 必須搭配 --smoke 或 --full" >&2
     exit 1
 fi
 MODE="${MODE:-smoke}"
@@ -48,6 +57,8 @@ source "${SCRIPT_DIR}/lib/monitor.sh"
 source "${SCRIPT_DIR}/lib/arcstats.sh"
 # shellcheck source=lib/fiorun.sh
 source "${SCRIPT_DIR}/lib/fiorun.sh"
+# shellcheck source=lib/l2arc.sh
+source "${SCRIPT_DIR}/lib/l2arc.sh"
 
 if [[ "$ACTION" == "preflight-only" ]]; then
     run_preflight_basic
@@ -73,6 +84,10 @@ source "${SCRIPT_DIR}/phases/50_write.sh"
 source "${SCRIPT_DIR}/phases/60_mixed.sh"
 # shellcheck source=phases/70_slog.sh
 source "${SCRIPT_DIR}/phases/70_slog.sh"
+# shellcheck source=phases/80_iso2.sh
+source "${SCRIPT_DIR}/phases/80_iso2.sh"
+# shellcheck source=phases/90_slog2.sh
+source "${SCRIPT_DIR}/phases/90_slog2.sh"
 
 TS="$(date +%Y%m%d-%H%M%S)"
 RESULTS_DIR="${BASE_DIR}/results/${TS}"
@@ -94,6 +109,10 @@ trap 'log_error "收到中斷訊號"; exit 1' INT TERM
 log_section "run_all.sh 開始 (MODE=$MODE, RESULTS_DIR=$RESULTS_DIR)"
 
 run_preflight_basic
+# 診斷模式會拆裝 L2ARC：必須在 save_state 之前確認它目前在位，否則狀態檔會記下空的裝置名稱而無法還原
+if [[ "$DIAG" == "1" && -z "$L2ARC_DEVICE" ]]; then
+    die "--diag 需要 pool 上有 L2ARC (cache) 裝置，但 zpool status ${POOL} 找不到；若上次中斷過請先參考 state/original.env 的 ORIG_L2ARC_DEVICE 手動裝回"
+fi
 save_state
 stop_vms
 run_preflight_export_ready
@@ -112,7 +131,47 @@ set_arc_max_for_round() {
     fi
 }
 
+# --diag：只跑診斷 phase（80 隔離矩陣 v2、90 SLOG 併發掃描），不重做預熱與其他 phase。
+# Phase 90 只在 Round 2（ARC 48GiB，測試檔全進記憶體）跑，讓 sync 寫入不混入讀取。
+run_diag_flow() {
+    phase_00_prepare "${RESULTS_DIR}/setup/00_prepare" \
+        || record_failure "diag:00_prepare" "phase 回傳非零狀態，繼續下一階段"
+    phase_80_iso2_setup "${RESULTS_DIR}/setup" \
+        || record_failure "diag:setup" "診斷測試檔建立失敗，Phase 80 各輪將被略過"
+
+    local round round_dir
+    for round in "${ROUNDS[@]}"; do
+        log_section "===== 診斷 Round $round 開始 ====="
+        set_arc_max_for_round "$round"
+        sleep 5  # 讓 arc_max 生效
+
+        round_dir="${RESULTS_DIR}/round${round}"
+        mkdir -p "$round_dir"
+
+        phase_80_iso2 "${round_dir}/80_iso2" \
+            || record_failure "round${round}:80_iso2" "phase 回傳非零狀態，繼續下一階段"
+        if [[ "$round" == "2" ]]; then
+            phase_90_slog2 "${round_dir}/90_slog2" \
+                || record_failure "round${round}:90_slog2" "phase 回傳非零狀態，繼續下一階段"
+        fi
+
+        log_section "===== 診斷 Round $round 結束 ====="
+    done
+
+    phase_80_iso2_cleanup
+
+    log_section "產出 diag_summary.txt"
+    python3 "${SCRIPT_DIR}/summarize_diag.py" "$RESULTS_DIR" \
+        || log_warn "summarize_diag.py 執行失敗，請人工檢查 $RESULTS_DIR"
+}
+
 load_state  # 取得 ORIG_ARC_MAX 供 round1 使用
+
+if [[ "$DIAG" == "1" ]]; then
+    run_diag_flow
+    log_info "run_all.sh 診斷模式全部完成: $RESULTS_DIR"
+    exit 0   # 由 EXIT trap 執行 restore_state
+fi
 
 for round in "${ROUNDS[@]}"; do
     log_section "===== Round $round 開始 ====="
