@@ -57,15 +57,19 @@ _export_import_pool() {
         return 1
     fi
 
-    local tries=3 i
+    # export 後 iSCSI 裝置掃描可能延遲，第一次 import 曾回報 "no such pool available"；
+    # 且 pool 也可能在重試間隙已被 zed/其他機制 import 起來（後續重試會回報
+    # "already exists"，實際上 pool 已可用），所以每次重試前先確認 pool 是否已在線。
+    local tries=10 i
     for (( i = 1; i <= tries; i++ )); do
-        if zpool import "$POOL"; then
+        if zpool list -H -o name "$POOL" >/dev/null 2>&1 || zpool import "$POOL"; then
             _wait_zvol_links_ready \
                 || record_failure "40_coldhot:${tier}" "zvol 裝置連結逾時未出現，後續若需啟動掛在此 pool 上的 VM 可能失敗，請人工確認 /dev/zvol/${POOL}/"
             return 0
         fi
-        log_warn "zpool import 第 ${i}/${tries} 次失敗，3 秒後重試"
-        sleep 3
+        log_warn "zpool import 第 ${i}/${tries} 次失敗，5 秒後重試"
+        sleep 5
+        udevadm settle --timeout=10 2>/dev/null || true
     done
 
     die "zpool export 已執行但重試 ${tries} 次 import 皆失敗，pool 可能處於不可用狀態，必須立即人工介入: zpool import ${POOL}"

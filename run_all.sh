@@ -15,16 +15,18 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ACTION=""
+ROUND_ONLY=""
 for arg in "$@"; do
     case "$arg" in
         --preflight-only) ACTION="preflight-only" ;;
         --smoke)          ACTION="run"; MODE="smoke" ;;
         --full)           ACTION="run"; MODE="full" ;;
+        --round=1|--round=2) ROUND_ONLY="${arg#--round=}" ;;
         *) echo "未知參數: $arg" >&2; exit 1 ;;
     esac
 done
 if [[ -z "$ACTION" ]]; then
-    echo "用法: $0 --preflight-only | --smoke | --full" >&2
+    echo "用法: $0 --preflight-only | --smoke | --full [--round=1|--round=2]" >&2
     exit 1
 fi
 MODE="${MODE:-smoke}"
@@ -32,6 +34,8 @@ export MODE
 
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
+# --round=N：只跑指定的一輪（例如上次跑到一半中止後只補跑 Round 2）
+[[ -n "$ROUND_ONLY" ]] && ROUNDS=("$ROUND_ONLY")
 # shellcheck source=lib/preflight.sh
 source "${SCRIPT_DIR}/lib/preflight.sh"
 # shellcheck source=lib/state.sh
