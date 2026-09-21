@@ -43,7 +43,7 @@ cp .env.example .env
 ./run_all.sh --full               # 正式規模（約 12 小時，兩輪）
 ./run_all.sh --full --round=2     # 只跑指定的一輪（--round=1 或 --round=2），中止後補跑用
 ./run_all.sh --smoke --diag       # 診斷模式縮小規模驗證（約 10 分鐘）
-./run_all.sh --full --diag        # 診斷模式正式規模（約 3.5-4 小時）
+./run_all.sh --full --diag        # 診斷模式正式規模（實測約 10 小時，其中四次 64GiB 循序暖機各約 2 小時）
 ```
 
 建議背景執行正式規模的測試。若是透過 `ssh` 遠端啟動，請把 stdin/stdout 都重導並用 `setsid`，否則背景行程會握住 ssh 連線，指令一直不返回：
@@ -132,6 +132,48 @@ state/original.env       # 執行期間的原始組態快照，已列入 .gitign
 4. SLOG 併發度掃描表：各 numjobs 的 standard / removed / rawdev，附穩定性判定
 5. 儲存環境重點（LUN 寫入快取模式等）
 
+## 實測結論（測試主機，2026-09）
+
+環境：ZFS pool 建在 Synology iSCSI LUN 上（`write_cache: write back`、`rotational: 1`，機械硬碟），單次隨機未命中約 55–86ms；`zfs_arc_max` 預設 3.13GiB（主機 96GB RAM）；L2ARC 與 SLOG 是同一顆消費級 NVMe（Samsung 980，無斷電保護）的兩個分割區。以下數字來自 `--diag`，全程無失敗紀錄。
+
+### 讀取：快取層貢獻（Phase 80，64GiB 資料集，4 併發 4K 隨機讀）
+
+| ARC 上限 | 組態 | IOPS | 命中歸因（ARC / L2ARC / 磁碟） | p99 |
+|---|---|---:|---|---:|
+| 3.13GiB | raw | 54 | 15% / 0% / 85% | 158ms |
+| 3.13GiB | arconly | 67 | 15% / 0% / 85% | 135ms |
+| 3.13GiB | full | 13,570 | 5% / 95% / 0.3% | 0.4ms |
+| 48GiB | raw | 62 | 12% / 0% / 88% | 111ms |
+| 48GiB | arconly | 272 | 73% / 0% / 27% | 57ms |
+| 48GiB | full | 43,396 | 72% / 28% / 0% | 0.33ms |
+
+- **IOPS 幾乎完全由未命中率決定**：IOPS ≈ 併發數 ÷（未命中率 × 每次未命中成本），每次未命中成本 55–86ms，六組數據都吻合。在這種後端，命中率的小差距會被放大：48GiB ARC 命中 73% 卻只有 272 IOPS，剩下 27% 的未命中把平均延遲撐到約 15ms。
+- **L2ARC 在資料集完整放得進 ARC + L2ARC 時決定性地有效**：它把未命中降到 0，相對 arconly 快約 50–200 倍。舊 Phase 30 得出的「L2ARC 只貢獻 +5~16 IOPS」是量測缺陷（快取未清乾淨、也沒暖好），不成立。
+- **ARC 大小仍有約 3 倍差距**：同樣有 L2ARC，3.13GiB ARC 為 13.5K IOPS，48GiB 為 43K IOPS（命中 ARC 比命中 L2ARC 便宜）。
+- **前提與限制**：
+  - 這是用約 2 小時的強制循序暖機換來的；實際上線時 L2ARC 只隨真實讀取慢慢填入，達到同樣效果需要多久取決於工作負載。
+  - 資料是均勻隨機存取；真實工作負載有熱點時結果會不同。
+  - 資料集超過 ARC + L2ARC 時快取幫不上忙（一般模式的 300GiB tier 實測約 100 IOPS）。
+
+### 寫入：SLOG 併發度掃描（Phase 90，Round 2，4K 隨機 sync 寫）
+
+| numjobs | standard（有 SLOG） | removed（拔除） | rawdev（SLOG 裸裝置） | 平均倍率 | 最差 standard ÷ 最佳 removed |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1,734 | 839 | 1,623 | 2.1× | 1.7× |
+| 4 | 2,411 | 1,090 | 3,367 | 2.2× | 1.5× |
+| 16 | 6,293 | 1,506 | 2,648 | 4.2× | 3.9× |
+| 64 | 5,493 | 1,831 | 3,871 | 3.0× | 2.3× |
+
+- **SLOG 有效，且併發越高越明顯**：每個併發度下，最差的 `standard` 都比最好的 `removed` 快。ZFS 會把多個 sync 寫入合併成同一個 ZIL block，所以 ZFS 層的 IOPS 可以超過裸裝置的 IOPS。
+- `standard` 自身波動大（例如 4 併發 1,659 與 3,163），所以 `diag_summary.txt` 標了「不穩定」；`removed` 則很一致（重複差異約 3–14%）。
+- **與 Phase 70 矛盾**：Phase 70 在 4 併發下 `standard` 1,470 ≈ `removed` 1,492。目前的假說是 Phase 70 混有 `sync=disabled` 組態污染了相鄰測試（見「已知限制」），尚未驗證；Phase 90 沒有 `disabled`，SLOG 結論以它為準。
+
+### 配置建議（以本機測試為據，針對 4K 隨機讀 + fsync 寫入的負載）
+
+1. **保留 L2ARC 與 SLOG，不要拆**：兩者在乾淨測試中都有數倍到數十倍的貢獻。
+2. **提高 `zfs_arc_max`**：預設 3.13GiB 對 96GB RAM 的主機明顯過小，Round 2 顯示約 3 倍差距。這次測試只暫時調整，**沒有**修改持久設定；要持久化需編輯 `/etc/modprobe.d/zfs.conf` 並執行 `update-initramfs -u`。
+3. **熱資料集要放得進 ARC + L2ARC**（本機約 127GiB 的 L2ARC）才有上述效果；超過的部分仍然受限於後端約 55–86ms 的未命中成本。
+
 ## 已知限制
 
 - **Phase 30 的隔離組態不乾淨**：`raw` 仍會命中前一階段暖機留下的 ARC/L2ARC 資料（`raw` 的歸因表仍顯示數十 % 命中），所以 `arconly − raw`、`full − arconly` 是低估。ARC/L2ARC 的貢獻請以 `--diag` 的 Phase 80 為準。
@@ -139,7 +181,8 @@ state/original.env       # 執行期間的原始組態快照，已列入 .gitign
 - **`sync=disabled` 不是有意義的上限**：測到的是寫進 ARC 的記憶體速度，不代表後端能力。
 - **`die` 中止不會寫入 `failures.log`**：run 若被 `die`（例如 import 重試耗盡）中止，`summary.txt` 仍可能印「所有階段皆正常完成」。判斷一次執行是否完整，請同時看 `full.out` 是否有「run_all.sh 全部完成」。
 - **手動停機的 VM 不會被腳本啟動**：開跑前你自己停掉的 VM（例如 export 需要關閉的 zvol 使用者），測試結束後要自己 `qm start`。
-- **耗時**：`--full` 實測約 12 小時（Phase 10 填 300GiB 約 1 小時、各 30 分鐘級的寫入/混合測試），`--diag --full` 約 3.5–4 小時。
+- **耗時**：`--full` 實測約 12 小時（Phase 10 填 300GiB 約 1 小時、各 30 分鐘級的寫入/混合測試）。`--diag --full` 實測約 10 小時：循序暖機讀 64GiB 只有約 9MB/s（iSCSI 機械硬碟的單執行緒循序讀延遲高），每次約 2 小時，共 4 次；評估耗時時不要用預熱寫入速度（約 95MB/s）去推。
+- **Phase 70 的 `sync=disabled` 可能污染相鄰測試（假說，未驗證）**：`disabled` 組態以記憶體速度大量寫入，結束後 txg 仍需長時間把髒資料刷到後端，可能拖慢緊接著的 `standard`/`removed` 測試，這也許是 Phase 70 與 Phase 90 的 SLOG 結果互相矛盾的原因（見「實測結論」）。Phase 90 沒有混入 `disabled`，SLOG 結論請以它為準。
 
 ## 需求
 
