@@ -16,7 +16,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from summarize import TestResult, collect_round, fmt, load_failures
+import re
+
+from summarize import TestResult, collect_round, fmt, load_failures, load_json, ns_to_us
 
 GIB = 1024 ** 3
 ISO2_CONFIGS = ("raw", "arconly", "full")
@@ -27,6 +29,7 @@ SERIES_PRINT_EVERY_SEC = 60      # 逐時 IOPS 每隔多久印一個點
 SPREAD_WARN_PCT = 15.0           # 重複測試間差異超過此值視為不穩定
 SLOG_SIGNIFICANT_PCT = 15.0      # standard 與 removed 平均差超過此值才算有意義
 MIN_DISK_PCT_FOR_MODEL = 5.0     # 未命中率太低時，回推未命中成本沒有意義
+BACKEND_RANDOM_READ_IOPS = 64    # 實測後端 LUN 隨機讀飽和值（1/4/16/64 併發: 14/60/63/64 IOPS）
 
 
 def parse_kv(path: Path) -> dict[str, int]:
@@ -204,7 +207,7 @@ def _slog_verdict(std: tuple, rm: tuple) -> str:
 
 def section_slog2(out: list[str], round_dir: Path) -> None:
     out.append("## Phase 90 SLOG 併發度掃描（Round 2，ARC 48GiB，sync 4K 隨機寫，IOPS 為各重複平均）")
-    if not (round_dir / "90_slog2").exists():
+    if not any(round_dir.glob("90_slog2*")):
         out.append("(無資料)")
         out.append("")
         return
@@ -228,6 +231,106 @@ def section_slog2(out: list[str], round_dir: Path) -> None:
     out.append("")
 
 
+def _job_by_name(data: dict, jobname: str) -> dict:
+    for job in data.get("jobs", []):
+        if job.get("jobname") == jobname:
+            return job
+    return {}
+
+
+def _direction_stats(direction: dict) -> dict[str, float | None]:
+    clat = direction.get("clat_ns", {})
+    return {
+        "iops": direction.get("iops"),
+        "mean_us": ns_to_us(clat.get("mean")),
+        "p99_us": ns_to_us(clat.get("percentile", {}).get("99.000000")),
+    }
+
+
+def collect_mixsync(phase_dir: Path) -> dict[str, list[dict]]:
+    """名稱格式 mixsync_<cond>_r<rep>.json，jobs 內 mix_read / mix_write 兩個 group。"""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for json_path in sorted(phase_dir.glob("mixsync_*_r*.json")):
+        data = load_json(json_path)
+        if not data:
+            continue
+        grouped[json_path.stem.split("_")[1]].append({
+            "name": json_path.stem,
+            "read": _direction_stats(_job_by_name(data, "mix_read").get("read", {})),
+            "write": _direction_stats(_job_by_name(data, "mix_write").get("write", {})),
+        })
+    return grouped
+
+
+def section_mixsync(out: list[str], round_dir: Path) -> None:
+    out.append("## Phase 91 讀寫混合：16 讀取者（打向後端，L2ARC 已拆）+ 16 sync 寫入者，有無 SLOG")
+    phase_dir = round_dir / "91_mixed_sync"
+    if not phase_dir.exists():
+        out.append("(無資料)")
+        out.append("")
+        return
+
+    grouped = collect_mixsync(phase_dir)
+    out.append(f"{'run':<24}{'read_iops':>10}{'read_p99(ms)':>14}{'sync_w_iops':>13}{'w_mean(us)':>12}{'w_p99(us)':>12}")
+    for cond in ("standard", "removed"):
+        for run in grouped.get(cond, []):
+            r, w = run["read"], run["write"]
+            out.append(f"{run['name']:<24}{fmt(r['iops'], decimals=0):>10}"
+                       f"{fmt(r['p99_us'] / 1000 if r['p99_us'] else None, decimals=0):>14}"
+                       f"{fmt(w['iops'], decimals=0):>13}{fmt(w['mean_us'], decimals=0):>12}{fmt(w['p99_us'], decimals=0):>12}")
+
+    means = {cond: _mean_spread([run["write"]["iops"] or 0 for run in runs])[0]
+             for cond, runs in grouped.items()}
+    std, rm = means.get("standard"), means.get("removed")
+    if std and rm:
+        out.append(f"  sync 寫入 IOPS 平均: standard={std:.0f}  removed={rm:.0f}  倍率={std / rm:.1f}x")
+    out.append("  (讀取者會把後端 LUN 打到飽和；沒有 SLOG 時 ZIL 寫入要和讀取排同一條佇列)")
+    out.append("")
+
+
+def section_arcsweep(out: list[str], round_dir: Path, ws_gib: float | None) -> None:
+    out.append("## Phase 92 ARC 大小掃描（L2ARC 暖好，固定熱資料集，4 併發 4K 隨機讀）")
+    sweep_dir = round_dir / "92_arcsweep"
+    if not sweep_dir.exists():
+        out.append("(無資料)")
+        out.append("")
+        return
+
+    populate = parse_kv(sweep_dir / "arcsweep_populate_state.txt")
+    if populate:
+        used_warm_fallback = (sweep_dir / "arcsweep_warm_state.txt").exists()
+        out.append(f"  L2ARC 暖機後 l2_asize={populate.get('l2_asize', 0) / GIB:.1f}GiB"
+                   f"（{'覆寫不足，退回循序讀暖機' if used_warm_fallback else '覆寫填入即達標，未用循序讀暖機'}）"
+                   f"  熱資料集={fmt(ws_gib, 'GiB', 1)}")
+
+    results = collect_round(round_dir)
+    log_avg_msec = read_log_avg_msec(sweep_dir)
+    sizes = sorted(int(m.group(1)) for n in results if (m := re.fullmatch(r"arcsweep_(\d+)g", n)))
+    out.append(f"{'ARC_GiB':>8}{'ARC/資料集':>11}{'r_iops':>9}{'steady':>9}{'ARC%':>7}{'L2%':>7}{'disk%':>7}"
+               f"{'cap_by_miss':>12}{'p99(us)':>10}{'L2_GiB':>8}{'l2hdr_MiB':>10}")
+    for gib in sizes:
+        name = f"arcsweep_{gib}g"
+        r = results[name]
+        series = read_iops_series(sweep_dir, name, log_avg_msec)
+        start = parse_kv(sweep_dir / f"{name}_state_start.txt")
+        end = parse_kv(sweep_dir / f"{name}_state_end.txt")
+        a = r.attribution or {}
+        disk_pct = a.get("disk_pct")
+        cap = BACKEND_RANDOM_READ_IOPS / (disk_pct / 100.0) if disk_pct and disk_pct >= 0.5 else None
+        ratio = f"{gib / ws_gib * 100:.0f}%" if ws_gib else "n/a"
+        l2_gib = start["l2_asize"] / GIB if "l2_asize" in start else None
+        hdr_mib = end["l2_hdr_size"] / (1024 ** 2) if "l2_hdr_size" in end else None
+        out.append(f"{gib:>8}{ratio:>11}{fmt(r.read_iops(), decimals=0):>9}{fmt(steady_iops(series), decimals=0):>9}"
+                   f"{fmt(a.get('arc_hit_pct'), decimals=1):>7}{fmt(a.get('l2arc_hit_pct'), decimals=1):>7}"
+                   f"{fmt(disk_pct, decimals=1):>7}{fmt(cap, decimals=0):>12}{fmt(r.read_lat_p99(), decimals=0):>10}"
+                   f"{fmt(l2_gib, decimals=1):>8}{fmt(hdr_mib, decimals=0):>10}")
+    if not sizes:
+        out.append("(無資料)")
+    out.append(f"  (cap_by_miss = {BACKEND_RANDOM_READ_IOPS} ÷ 未命中率：後端只能給約 {BACKEND_RANDOM_READ_IOPS} 次隨機讀/秒時，"
+               "該未命中率下的 IOPS 上限；L2_GiB 為 export/import 後 L2ARC 保留量)")
+    out.append("")
+
+
 def section_env_highlights(out: list[str], round_dir: Path) -> None:
     out.append("## 儲存環境重點（完整內容見 round*/80_iso2/env_storage.txt）")
     env = round_dir / "80_iso2" / "env_storage.txt"
@@ -239,6 +342,17 @@ def section_env_highlights(out: list[str], round_dir: Path) -> None:
             "Target:", "logbias", "sync", "ashift", "zfs_dirty_data_max", "zil_slog_bulk")
     out.extend(f"  {line}" for line in env.read_text().splitlines() if any(k in line for k in keys))
     out.append("")
+
+
+def _dataset_gib(results_dir: Path) -> float | None:
+    """從診斷測試檔的填充率斷言檔取得熱資料集大小（GiB）。"""
+    fill = results_dir / "setup" / "fill_ratio_iso2.txt"
+    if not fill.exists():
+        return None
+    for line in fill.read_text().splitlines():
+        if line.startswith("apparent_bytes="):
+            return int(line.split("=", 1)[1]) / GIB
+    return None
 
 
 def main() -> None:
@@ -266,13 +380,19 @@ def main() -> None:
     iso_by_round: dict[str, dict[str, TestResult]] = {}
     for round_name in ("round1", "round2"):
         round_dir = results_dir / round_name
-        if round_dir.exists():
+        if (round_dir / "80_iso2").exists():
             iso_by_round[round_name] = section_iso2_round(out, round_name, round_dir)
 
-    section_clean_contribution(out, iso_by_round)
+    if iso_by_round:
+        section_clean_contribution(out, iso_by_round)
 
-    if (results_dir / "round2").exists():
-        section_slog2(out, results_dir / "round2")
+    round2 = results_dir / "round2"
+    if round2.exists():
+        section_slog2(out, round2)
+        if (round2 / "91_mixed_sync").exists():
+            section_mixsync(out, round2)
+        if (round2 / "92_arcsweep").exists():
+            section_arcsweep(out, round2, _dataset_gib(results_dir))
     for round_name in ("round1", "round2"):
         if (results_dir / round_name / "80_iso2" / "env_storage.txt").exists():
             section_env_highlights(out, results_dir / round_name)

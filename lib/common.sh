@@ -65,6 +65,7 @@ ARCSTATS_PATH="/proc/spl/kstat/zfs/arcstats"
 ARC_MAX_PARAM="/sys/module/zfs/parameters/zfs_arc_max"
 L2ARC_WRITE_MAX_PARAM="/sys/module/zfs/parameters/l2arc_write_max"
 L2ARC_NOPREFETCH_PARAM="/sys/module/zfs/parameters/l2arc_noprefetch"
+ARC_MAX_ROUND1_BYTES=3359637504    # 3.13 GiB，測試用的小 ARC 基準，與主機正式 zfs_arc_max 脫鉤
 ARC_MAX_ROUND2_BYTES=51539607552   # 48 GiB
 L2ARC_WRITE_MAX_WARM_BYTES=536870912  # 512 MiB/s，暖機期間暫時調高
 
@@ -104,6 +105,15 @@ if [[ "$MODE" == "smoke" ]]; then
     RUNTIME_SLOG2=15
     RUNTIME_SLOG2_RAW=10
     SLOG2_REPEATS=1
+    # --diag2 追加診斷（phases/91_mixed_sync.sh、92_arcsweep.sh）
+    DIAG2_ISO_SIZE_MIB=512
+    DIAG2_SLOG_NUMJOBS=(8 16)
+    MIXSYNC_READERS=4
+    MIXSYNC_WRITERS=4
+    RUNTIME_MIXSYNC=20
+    MIXSYNC_REPEATS=1
+    ARCSWEEP_SIZES_GIB=(4 8)
+    RUNTIME_ARCSWEEP=20
 else
     TIER_NAMES=(t1 t2 t3)
     declare -A TIER_SIZE_MIB=([t1]=2048 [t2]=65536 [t3]=307200)
@@ -128,6 +138,15 @@ else
     RUNTIME_SLOG2=90
     RUNTIME_SLOG2_RAW=60
     SLOG2_REPEATS=2
+    # --diag2 追加診斷（phases/91_mixed_sync.sh、92_arcsweep.sh）
+    DIAG2_ISO_SIZE_MIB=32768         # ARC 掃描的熱資料集大小（32GiB；ARC/資料集比例才是重點）
+    DIAG2_SLOG_NUMJOBS=(128 256)     # 補測 64 以上的高併發
+    MIXSYNC_READERS=16               # 讀取者：打向後端，用來製造與 ZIL 寫入的排隊競爭
+    MIXSYNC_WRITERS=16               # sync 寫入者
+    RUNTIME_MIXSYNC=300
+    MIXSYNC_REPEATS=2
+    ARCSWEEP_SIZES_GIB=(4 8 16 32)
+    RUNTIME_ARCSWEEP=420
 fi
 
 SLOG_REPEATS=2   # 每個 sync 組態（standard/disabled/removed）重複次數，用來確認結果穩定，不是單次波動

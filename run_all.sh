@@ -1,5 +1,6 @@
 #!/bin/bash
-# run_all.sh - 進入點。驅動 preflight -> 停 VM -> 兩輪測試（ARC 3.13GiB / 48GiB）
+# run_all.sh - 進入點。驅動 preflight -> 停 VM -> 兩輪測試（ARC_MAX_ROUND1_BYTES / ARC_MAX_ROUND2_BYTES，
+# 見 lib/common.sh；與主機正式 zfs_arc_max 脫鉤，固定用小/大兩個基準值對照）
 # -> 每輪跑 8 個 phase -> 還原所有組態 -> 產出 summary.txt。
 #
 # 用法:
@@ -8,7 +9,9 @@
 #   ./run_all.sh --full             正式規模（約 10 小時，兩輪）
 #   ./run_all.sh --full --round=2   只跑指定的一輪（--round=1 或 --round=2，中止後補跑用）
 #   ./run_all.sh --full --diag      診斷模式：只跑 Phase 80（隔離矩陣 v2）與 Phase 90（SLOG 併發掃描），
-#                                   會暫時拆裝 L2ARC 與 SLOG 裝置（約 4 小時）；--smoke --diag 為縮小規模驗證
+#                                   會暫時拆裝 L2ARC 與 SLOG 裝置（實測約 10 小時）；--smoke --diag 為縮小規模驗證
+#   ./run_all.sh --full --diag2     追加診斷：SLOG 高併發補測、讀寫混合 sync 寫入（Phase 91）、
+#                                   ARC 大小掃描（Phase 92）；同樣會暫時拆裝 L2ARC 與 SLOG
 #
 # 建議搭配 nohup 背景執行:
 #   nohup ./run_all.sh --smoke > smoke.out 2>&1 & echo $! > run.pid
@@ -27,15 +30,16 @@ for arg in "$@"; do
         --full)           ACTION="run"; MODE="full" ;;
         --round=1|--round=2) ROUND_ONLY="${arg#--round=}" ;;
         --diag)           DIAG=1 ;;
+        --diag2)          DIAG=2 ;;
         *) echo "未知參數: $arg" >&2; exit 1 ;;
     esac
 done
 if [[ -z "$ACTION" ]]; then
-    echo "用法: $0 --preflight-only | --smoke | --full [--round=1|--round=2] [--diag]" >&2
+    echo "用法: $0 --preflight-only | --smoke | --full [--round=1|--round=2] [--diag|--diag2]" >&2
     exit 1
 fi
-if [[ "$DIAG" == "1" && "$ACTION" != "run" ]]; then
-    echo "--diag 必須搭配 --smoke 或 --full" >&2
+if [[ "$DIAG" != "0" && "$ACTION" != "run" ]]; then
+    echo "--diag / --diag2 必須搭配 --smoke 或 --full" >&2
     exit 1
 fi
 MODE="${MODE:-smoke}"
@@ -88,6 +92,10 @@ source "${SCRIPT_DIR}/phases/70_slog.sh"
 source "${SCRIPT_DIR}/phases/80_iso2.sh"
 # shellcheck source=phases/90_slog2.sh
 source "${SCRIPT_DIR}/phases/90_slog2.sh"
+# shellcheck source=phases/91_mixed_sync.sh
+source "${SCRIPT_DIR}/phases/91_mixed_sync.sh"
+# shellcheck source=phases/92_arcsweep.sh
+source "${SCRIPT_DIR}/phases/92_arcsweep.sh"
 
 TS="$(date +%Y%m%d-%H%M%S)"
 RESULTS_DIR="${BASE_DIR}/results/${TS}"
@@ -110,8 +118,8 @@ log_section "run_all.sh 開始 (MODE=$MODE, RESULTS_DIR=$RESULTS_DIR)"
 
 run_preflight_basic
 # 診斷模式會拆裝 L2ARC：必須在 save_state 之前確認它目前在位，否則狀態檔會記下空的裝置名稱而無法還原
-if [[ "$DIAG" == "1" && -z "$L2ARC_DEVICE" ]]; then
-    die "--diag 需要 pool 上有 L2ARC (cache) 裝置，但 zpool status ${POOL} 找不到；若上次中斷過請先參考 state/original.env 的 ORIG_L2ARC_DEVICE 手動裝回"
+if [[ "$DIAG" != "0" && -z "$L2ARC_DEVICE" ]]; then
+    die "--diag / --diag2 需要 pool 上有 L2ARC (cache) 裝置，但 zpool status ${POOL} 找不到；若上次中斷過請先參考 state/original.env 的 ORIG_L2ARC_DEVICE 手動裝回"
 fi
 save_state
 stop_vms
@@ -121,7 +129,7 @@ set_arc_max_for_round() {
     local round="$1"
     local target
     if [[ "$round" == "1" ]]; then
-        target="$ORIG_ARC_MAX"
+        target="$ARC_MAX_ROUND1_BYTES"
     else
         target="$ARC_MAX_ROUND2_BYTES"
     fi
@@ -165,10 +173,45 @@ run_diag_flow() {
         || log_warn "summarize_diag.py 執行失敗，請人工檢查 $RESULTS_DIR"
 }
 
-load_state  # 取得 ORIG_ARC_MAX 供 round1 使用
+# --diag2：追加診斷。SLOG 高併發補測與讀寫混合沿用 Round 2 的 ARC（48GiB），與 --diag 的 Phase 90
+# 條件一致；ARC 大小掃描（Phase 92）自己管理 zfs_arc_max。全部只用 Round 2 目錄存放結果。
+run_diag2_flow() {
+    phase_00_prepare "${RESULTS_DIR}/setup/00_prepare" \
+        || record_failure "diag2:00_prepare" "phase 回傳非零狀態，繼續下一階段"
 
-if [[ "$DIAG" == "1" ]]; then
-    run_diag_flow
+    # 熱資料集縮為 DIAG2_ISO_SIZE_MIB：ARC/資料集的「比例」才是重點，也縮短建檔時間
+    ISO2_SIZE_MIB="$DIAG2_ISO_SIZE_MIB"
+    phase_80_iso2_setup "${RESULTS_DIR}/setup" \
+        || record_failure "diag2:setup" "診斷測試檔建立失敗，Phase 91/92 將被略過"
+
+    local round_dir="${RESULTS_DIR}/round2"
+    mkdir -p "$round_dir"
+    set_arc_max_for_round 2
+    sleep 5  # 讓 arc_max 生效
+
+    SLOG2_NUMJOBS=("${DIAG2_SLOG_NUMJOBS[@]}")
+    phase_90_slog2 "${round_dir}/90_slog2_hi" \
+        || record_failure "diag2:90_slog2_hi" "phase 回傳非零狀態，繼續下一階段"
+    phase_91_mixed_sync "${round_dir}/91_mixed_sync" \
+        || record_failure "diag2:91_mixed_sync" "phase 回傳非零狀態，繼續下一階段"
+    phase_92_arcsweep "${round_dir}/92_arcsweep" \
+        || record_failure "diag2:92_arcsweep" "phase 回傳非零狀態，繼續下一階段"
+
+    phase_80_iso2_cleanup
+
+    log_section "產出 diag_summary.txt"
+    python3 "${SCRIPT_DIR}/summarize_diag.py" "$RESULTS_DIR" \
+        || log_warn "summarize_diag.py 執行失敗，請人工檢查 $RESULTS_DIR"
+}
+
+load_state  # 取得 ORIG_ARC_MAX，供中斷還原與 92_arcsweep.sh 收尾時還原成主機正式值使用
+
+if [[ "$DIAG" != "0" ]]; then
+    if [[ "$DIAG" == "2" ]]; then
+        run_diag2_flow
+    else
+        run_diag_flow
+    fi
     log_info "run_all.sh 診斷模式全部完成: $RESULTS_DIR"
     exit 0   # 由 EXIT trap 執行 restore_state
 fi
