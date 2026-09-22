@@ -134,7 +134,7 @@ state/original.env       # 執行期間的原始組態快照，已列入 .gitign
 
 ## 實測結論（測試主機，2026-09）
 
-環境：ZFS pool 建在 Synology iSCSI LUN 上（`write_cache: write back`、`rotational: 1`，機械硬碟），單次隨機未命中約 55–86ms；`zfs_arc_max` 當時預設 3.13GiB（主機 94GiB RAM，含 host 開銷約 96GB 標稱）；L2ARC 與 SLOG 是同一顆消費級 NVMe（Samsung 980，無斷電保護，尚有 643.5GiB 未分割）的兩個分割區（SLOG 32GiB、L2ARC 128GiB）。以下數字來自 `--diag`，全程無失敗紀錄，記錄的是當時 3.13GiB 的量測條件；**正式環境已於 2026-09-22 依此數據改為 `zfs_arc_max=48GiB`**（見下方「配置建議」）。
+環境：ZFS pool 建在 Synology iSCSI LUN 上（`write_cache: write back`、`rotational: 1`，機械硬碟），單次隨機未命中約 55–86ms；`zfs_arc_max` 當時預設 3.13GiB（主機 94GiB RAM，含 host 開銷約 96GB 標稱）；L2ARC 與 SLOG 是同一顆消費級 NVMe（Samsung 980，無斷電保護）的分割區，與 rpool（local-zfs 開機碟）共用同一顆盤。以下數字來自 `--diag`，全程無失敗紀錄，記錄的是當時 3.13GiB ARC / rpool 127GiB / L2ARC 128GiB 的量測條件；**正式環境已於 2026-09-22 依此數據調整**：`zfs_arc_max=48GiB`（見下方「配置建議」），並重建分割表把 rpool 擴大到 256GiB、L2ARC 擴大到 320GiB（SLOG 維持 32GiB），磁碟尾端仍留 322.5GiB 未分割。
 
 ### 讀取：快取層貢獻（Phase 80，64GiB 資料集，4 併發 4K 隨機讀）
 
@@ -172,7 +172,7 @@ state/original.env       # 執行期間的原始組態快照，已列入 .gitign
 
 1. **保留 L2ARC 與 SLOG，不要拆**：兩者在乾淨測試中都有數倍到數十倍的貢獻。
 2. **提高 `zfs_arc_max`**：原預設 3.13GiB 對 94GiB RAM 的主機明顯過小，Round 2 顯示約 3 倍差距。**已於 2026-09-22 套用**：`/etc/modprobe.d/zfs.conf` 改為 `zfs_arc_max=51539607552`（48GiB）並執行 `update-initramfs -u -k all` 持久化，同時用 `echo 51539607552 > /sys/module/zfs/parameters/zfs_arc_max` 立即生效不需重開機。48GiB 是抓「主機 94GiB − 全部 VM 開機尖峰用量 54GB − host 開銷 − L2ARC header − 緩衝」算出來、且已被上表實測驗證的值；`zfs_arc_min` 維持預設不動，讓 ARC 在 VM 需要記憶體時仍能讓出。
-3. **熱資料集要放得進 ARC + L2ARC**（本機約 127GiB 的 L2ARC）才有上述效果；超過的部分仍然受限於後端約 55–86ms 的未命中成本。L2ARC/SLOG 分割區大小目前判斷已足夠（SLOG 只需撐一個 txg 的 sync 寫入量，遠用不到 32GiB；L2ARC 128GiB 遠超目前 iSCSI 上實際運行中 VM 的熱資料集），暫不調整，待有更多 VM 常駐 iSCSI 後再視 `arcstat` 觀察。
+3. **熱資料集要放得進 ARC + L2ARC** 才有上述效果；超過的部分仍然受限於後端約 55–86ms 的未命中成本。**2026-09-22 已把 L2ARC 從 128GiB 擴大到 320GiB**（同時 rpool 從 127GiB 擴大到 256GiB，兩者共用的 NVMe 分割表已重建，SLOG 維持 32GiB 不變——它只需撐一個 txg 的 sync 寫入量，遠用不到 32GiB）。L2ARC header 佔用的 ARC 空間遠比直覺小：實測約為 L2ARC 資料量的 0.8%，320GiB 全滿時 header 也只佔約 2.6GiB，遠低於 48GiB 的 ARC 上限，不會排擠掉太多可用的 ARC 資料快取空間。
 
 ## 已知限制
 
